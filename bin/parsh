@@ -1,0 +1,673 @@
+#!/usr/bin/perl
+
+=head
+
+Copyright (c) 2010, Kimo Rosenbaum and contributors
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+    * Neither the name of the owner nor the names of its contributors
+      may be used to endorse or promote products derived from this
+      software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+=cut
+
+use strict;
+use warnings;
+
+#use Net::SSH::Perl::SFTP;
+use Net::SSH::Perl::SSH;
+use Data::Dumper;
+use File::stat;
+use Getopt::Long;
+use HTTP::Cookies;
+use JSON::DWIW;
+use Log::Log4perl qw(:easy);
+use LWP::UserAgent;
+use Net::Ping::External qw(ping);
+use Parallel::ForkManager;
+use POSIX;
+use Proc::Daemon;
+use Socket;
+use Term::ReadKey;
+use URI::Escape;
+
+##
+## Variables
+##
+
+Getopt::Long::Configure ("bundling");
+
+my $PARSH_URL = 'https://localhost/';
+
+my $API_URL = $PARSH_URL . 'api/w/v1/';
+my @COMMAND;
+my $COOKIE_JAR;
+my $CORPORATE_PASS;
+my $NODEGROUPS_URL = 'https://nodegroups.com/api/r/v2/list_nodes.php?format=json&expression=';
+my @NODES;
+my $JOB_ID;
+my $PASS;
+my $PM;
+my $ROOTPASS;
+my $STOP_COUNT;
+my $STOP_CURRENT = 0;
+my $SU;
+my $SUDO;
+my $TOKEN;
+my $UA;
+my %UPLOAD;
+my $USER;
+
+my %SSH_PARAMS;
+$SSH_PARAMS{'debug'} = 0;
+$SSH_PARAMS{'interactive'} = 1; # Net::SSH::Perl::SSH will not try keyboard-auth unless this is set
+$SSH_PARAMS{'options'} = [
+	'UserKnownHostsFile /dev/null',
+	'GlobalKnownHostsFile /dev/null',
+	'StrictHostKeyChecking no',
+];
+
+##
+## Subroutines
+##
+
+sub usage {
+	my $input = shift;
+
+	my $err;
+	my $fh;
+	if($input) {
+		$err = 1;
+		$fh = *STDERR;
+	} else {
+		$err = 0;
+		$fh = *STDOUT;
+	}
+
+	print $fh <<USAGE;
+Usage: parsh [OPTIONS] -c <command> node [node ...]
+Run command on given nodes in parallel.
+
+Options
+ -1		Only prompt for one password.
+ -Q		Only print fatal errors.
+ -c <command>	The command to run. May be used multiple times.
+ -e <number>	Stop after N errors. May be given as a whole
+		number or as a percentage. Default is 10%.
+ -h		This help message.
+ -j <jobs>	The number of nodes to do in parallel.
+		Default is 10.
+ -l <user>	SSH with a different username.
+ -q		Quiet.
+ -r		Automatically handle su password prompts.
+ -s		Automatically handle sudo password prompts.
+ -u <src:dest>	Upload src on local node to dest on remote node.
+		May be used multiple times.
+ -v		Increase verbosity.
+ --nodetach	Do not detach from terminal.
+USAGE
+
+	exit($err);
+}
+
+sub api {
+# Purpose: call parsh api
+# Inputs: api, data to POST
+# Returns: hashref
+
+	my ($api, $data) = @_;
+
+	TRACE($api);
+
+	my $response = $UA->post($API_URL . $api, $data);
+	if($response->code() eq '302') {
+		TRACE("$api gave 302, trying to get new SSO cookie");
+		my $sso = $UA->post('https://sso.com/login.php', {
+			'user' => $USER,
+			'password' => $CORPORATE_PASS,
+			'realm' => 'CORPORATE',
+		});
+
+		if(!$sso->is_success()) {
+			ERROR("Unable to get SSO cookie: " . $sso->status_line());
+			return {};
+		}
+
+		$response = $UA->post($API_URL . $api, $data);
+	}
+
+	if($response->is_success) {
+		my $output = JSON::DWIW->from_json($response->decoded_content());
+		TRACE($response->decoded_content());
+
+		if(defined($output->{'status'})) {
+			if($output->{'status'} eq '200') {
+				return $output->{'details'};
+			}
+
+			WARN($api . ': ' . $output->{'status'} . ' - ' . $output->{'message'});
+		} else {
+			WARN($api . ': ' . $response->decoded_content());
+		}
+	} else {
+		ERROR($api . ': ' . $response->status_line());
+	}
+
+	return {};
+}
+
+sub init {
+# Purpose: Get command line options, set things up, etc
+# Inputs: none
+# Returns: void (may exit)
+
+	my $detach = 1;
+	my $error_rate = '10%';
+	my $help;
+	my $jobs = 10;
+	my $log_options = { 'layout' => '%d: %P: %p - %m%n' };
+	my $one_pass;
+	my @upload;
+	my $verbose = 3;
+
+	my $argv = join(' ', @ARGV);
+
+	my $result = GetOptions(
+		'1' => \$one_pass,
+		'Q' => sub { $verbose = 1; },
+		'c|command=s' => \@COMMAND,
+		'e=s' => \$error_rate,
+		'h|help|?' => \$help,
+		'j|jobs=i' => \$jobs,
+		'l|login=s' => \$USER,
+		'q|quiet' => sub { $verbose = 2; },
+		'r|root!' => \$SU,
+		's|sudo!' => \$SUDO,
+		'u|upload=s' => \@upload,
+		'v|verbose' => sub { if($verbose lt 3) { $verbose = 3; }; $verbose++ },,
+		'detach!' => \$detach,
+	) || usage(1);
+
+	usage() if $help;
+
+	if($error_rate !~ m/^\d+\%?$/) {
+		print STDERR "Value \"$error_rate\" invalid for option e (number expected)\n";
+		usage(1);
+	}
+
+	if(scalar(@ARGV) < 1) {
+		usage(1);
+	}
+
+	if($verbose !~ m/^\d+$/) {
+		$verbose = 3;
+	}
+
+	if($verbose ge 5) {
+		$log_options->{'level'} = $TRACE;
+		$log_options->{'layout'} = '%d: %P: %p - %M{1}() %m%n';
+	} elsif($verbose ge 4) {
+		$log_options->{'level'} = $DEBUG;
+	} elsif($verbose ge 3) {
+		$log_options->{'level'} = $INFO;
+	} elsif($verbose ge 2) {
+		$log_options->{'level'} = $WARN;
+	} elsif($verbose ge 1) {
+		$log_options->{'level'} = $ERROR;
+	} else {
+		$log_options->{'level'} = $FATAL;
+	}
+
+	Log::Log4perl->easy_init($log_options);
+
+	if(!$USER) {
+		$USER = scalar(getpwuid($>));
+	}
+
+	check_upload(@upload);
+
+	if(scalar(@COMMAND) < 1 && scalar(@upload) < 1) {
+		usage(1);
+	}
+
+	$UA = LWP::UserAgent->new();
+	$COOKIE_JAR = HTTP::Cookies->new();
+	$UA->cookie_jar($COOKIE_JAR);
+
+	get_nodes();
+
+	if(scalar(@NODES) < 1) {
+		print STDERR "No nodes given or found\n";
+		usage(1);
+	}
+
+	if($error_rate =~ m/(\d+)\%/) {
+		$STOP_COUNT = scalar(@NODES) * ($1 / 100);
+		# Round up to nearest whole number
+		$STOP_COUNT = floor($STOP_COUNT + 0.9);
+	} else {
+		$STOP_COUNT = $error_rate;
+	}
+
+	if($error_rate eq 0) {
+		$STOP_COUNT = scalar(@NODES) + 1;
+	}
+
+	if(scalar(@NODES) == 1) {
+	# No need to fork if there is only one node
+		$jobs = 1;
+	}
+
+	$CORPORATE_PASS = prompt_password('CORPORATE Password:');
+	if($one_pass) {
+		$PASS = $CORPORATE_PASS;
+	} else {
+		$PASS = prompt_password('SSH Password:');
+	}
+
+	if($SU) {
+		$ROOTPASS = prompt_password('Root password:');
+		$SSH_PARAMS{'use_pty'} = 1;
+		$detach = 0;
+	}
+
+	if($SUDO) {
+		$SSH_PARAMS{'use_pty'} = 1;
+		$detach = 0;
+	}
+
+	# Net::SSH::Perl::SSH is coded to not accept a password except
+	# from it's own _read_passphrase function. This makes
+	# connecting to multiple nodes unfeasible. So we overwrite
+	# it here to use the password we already asked for.
+
+	undef &Net::SSH::Perl::SSH::Util::Term::_read_passphrase;
+	sub _read_passphrase {
+		$PASS;
+	}
+	*Net::SSH::Perl::SSH::Util::Term::_read_passphrase = \&_read_passphrase;
+
+	# Set _read_yes_or_no() to just give 'yes'
+	undef &Net::SSH::Perl::SSH::Util::Term::_read_yes_or_no;
+	sub _read_yes_or_no {
+		1;
+	}
+	*Net::SSH::Perl::SSH::Util::Term::_read_yes_or_no = \&_read_yes_or_no;
+
+	my $new_job = api('start_job.php', {
+		'run_as_user' => $USER,
+		'parallel' => $jobs,
+		'command' => join(' && ', @COMMAND),
+		'files' => join(' ', @upload),
+		'nodes' => join(',', @NODES),
+		'argv' => $0 . ' ' . $argv,
+	});
+
+	if(!defined($new_job->{'job_id'})) {
+		FATAL('Unable to get job ID from parsh central command');
+		exit(1);
+	}
+
+	$JOB_ID = $new_job->{'job_id'};
+	$TOKEN = $new_job->{'token'};
+
+	INFO("Job ID: $JOB_ID");
+	INFO("Link: $PARSH_URL" . 'jobs/details.php?job_id=' . $JOB_ID);
+
+	if($detach) {
+		Proc::Daemon::Init;
+	}
+
+	if($jobs == 1) {
+	# Parallel::ForkManager treats '0' as no fork
+	# so if jobs is only set to 1, set to 0 to avoid
+	# the fork
+		$jobs = 0;
+	}
+
+	$PM = new Parallel::ForkManager($jobs);
+	$PM->run_on_finish(\&child_finish);
+}
+
+sub prompt_password {
+# Purpose: Prompt for a password/passphrase
+# Inputs: Text of prompt
+# Returns: chomp'd password
+
+	my $text = shift || 'Password:';
+
+	print $text;
+	ReadMode('noecho');
+	chomp(my $input = ReadLine(0));
+	ReadMode('restore');
+	print "\n";
+
+	return $input;
+}
+
+sub do_upload {
+# Purpose: upload files (if any) to node
+# Inputs: ssh object
+# Returns: stdout, stderr, exit
+
+	my $ssh = shift;
+
+	DEBUG("Uploading files");
+
+	my ($stdout, $stderr);
+	foreach my $src (keys(%UPLOAD)) {
+		my $dest = $UPLOAD{$src};
+
+		my $fh;
+		open($fh, '<', $src) || return(undef, undef, '-1', "$src: $!");
+		my $f_src = do { local $/; <$fh> };
+		close($fh);
+
+		my ($c_out, $c_err, $c_exit) = ${$ssh}->cmd("cat - >$dest", $f_src);
+
+		if($c_out) {
+			$stdout .= $c_out;
+		}
+
+		if($c_err) {
+			$stderr .= $c_err;
+		}
+
+		if(!defined($c_exit) || $c_exit ne '0') {
+			return($stdout, $stderr, $c_exit, undef);
+		}
+
+		my $stat = stat($src);
+		my $mode = sprintf("%04o", $stat->mode() & 07777);
+
+		my ($s_out, $s_err, $s_exit) = ${$ssh}->cmd("chmod $mode $dest");
+
+		if($s_out) {
+			$stdout .= $s_out;
+		}
+
+		if($s_err) {
+			$stderr .= $s_err;
+		}
+
+		if(!defined($s_exit) || $s_exit ne '0') {
+			return($stdout, $stderr, $s_exit, undef);
+		}
+
+=head
+# TODO: get Net::SSH::Perl::SFTP working with ssh object
+		my $sftp;
+		eval { $sftp = Net::SSH::Perl::SFTP->new($ssh); };
+		if($@) {
+			return (undef, undef, '-1', $@);
+		}
+
+		eval { $sftp->put($src, $dest); };
+		if($@) {
+			return (undef, undef, '-1', trim_croak($@));
+		}
+
+		my ($exit, $message) = $sftp->status();
+		return (undef, undef, $exit, $message);
+=cut
+	}
+
+	return ($stdout, $stderr, '0', undef);
+}
+
+sub do_ssh {
+# Purpose: ssh to the node and run given command
+# Inputs: node, Command to run
+# Returns:
+
+	my $node = shift;
+
+	my $alive = ping(host => $node);
+	if(!$alive) {
+		DEBUG("Not pinging");
+		return (undef, undef, '-1', 'no ping');
+	}
+
+	my ($stdout, $stderr);
+
+	my $ssh;
+	eval { $ssh = Net::SSH::Perl::SSH->new($node, %SSH_PARAMS); };
+	if($@) {
+		DEBUG("Not sshable");
+		return (undef, undef, '-1', trim_croak($@));
+	}
+
+	eval { $ssh->login($USER, $PASS); };
+	if($@) {
+		DEBUG("Not loginable");
+		return (undef, undef, '-1', trim_croak($@));
+	}
+
+	if(scalar(keys(%UPLOAD)) > 0) {
+		my ($u_stdout, $u_stderr, $u_exit, $u_message) = do_upload(\$ssh);
+		if(!defined($u_exit) || $u_exit ne '0') {
+			return ($u_stdout, $u_stderr, $u_exit, $u_message);
+		}
+
+		if($u_stdout) {
+			$stdout .= $u_stdout;
+		}
+
+		if($u_stderr) {
+			$stderr .= $u_stderr;
+		}
+	}
+
+	if(scalar(@COMMAND) < 1) {
+		return ($stdout, $stderr, '0', undef);
+	}
+
+	DEBUG('Running commands');
+
+	if($SUDO) {
+		# This next bit adds a handler to STDERR to look for password prompts
+		# and send the password. NOTE: THIS IS NOT FOOL PROOF
+		# Because of the way Net::SSH::Perl::SSH::SSH2::cmd handles stderr,
+		# we need to add non-password prompt STDERR to a variable so it is not lost.
+
+		$ssh->register_handler("stderr", sub {
+			my ($channel, $buffer) = @_;
+			my $str = $buffer->bytes;
+
+			if ($str eq "Password:") {
+				$channel->send_data($PASS . "\r\n");
+			} else {
+				$stderr .= $str;
+			}
+		});
+	}
+
+	if($SU) {
+		# This next bit adds a handler to STDOUT to look for password prompts
+		# and send the password. NOTE: THIS IS NOT FOOL PROOF
+		# Because of the way Net::SSH::Perl::SSH::SSH2::cmd handles stdout,
+		# we need to add non-password prompt STDOUT to a variable so it is not lost.
+
+		$ssh->register_handler("stdout", sub {
+			my ($channel, $buffer) = @_;
+			my $str = $buffer->bytes;
+
+			if ($str eq "Password:") {
+				$channel->send_data($ROOTPASS . "\r\n");
+			} else {
+				$stdout .= $str;
+			}
+		});
+	}
+
+	my $exit = '0';
+	foreach my $command (@COMMAND) {
+		my $s_stdout;
+		my $s_stderr;
+		($s_stdout, $s_stderr, $exit) = $ssh->cmd($command);
+
+		if($s_stdout) {
+			$stdout .= $s_stdout;
+		}
+
+		if($s_stderr) {
+			$stderr .= $s_stderr;
+		}
+
+		if(!defined($exit) || $exit ne '0') {
+			return ($stdout, $stderr, $exit, undef);
+		}
+	}
+
+	return ($stdout, $stderr, $exit, undef);
+}
+
+sub trim_croak {
+# Purpose: Quick/dirty way of only showing the message line and not
+#   the file and line numbers from a croak().
+# Inputs: message
+# Returns: trimmed message
+
+	my $message = shift;
+	$message =~ s|\s+at\s+[\w./-]+\s+line\s+\d+\s*$||;
+	chomp($message);
+	return $message;
+}
+
+sub check_upload {
+# Purpose: make sure any files to be uploaded exist and add to %upload.
+# Inputs: files to check
+# Returns: void, exits if any file doesn't exist
+
+	foreach my $t_up (@_) {
+		my ($src, $dest) = split(/:/, $t_up, 2);
+
+		if(!$dest) {
+			usage(1);
+		}
+
+		if(! -e $src) {
+			FATAL($src . ': No such file or directory');
+			exit(1);
+		}
+
+		$UPLOAD{$src} = $dest;
+	}
+}
+
+sub get_nodes {
+# Purpose: Get nodes from cli and get list from nodegroups
+# Inputs: none
+
+	DEBUG('Parsing nodes');
+
+	my $expr = join(',', @ARGV);
+	my $response = $UA->post($NODEGROUPS_URL . uri_escape($expr));
+
+	if($response->is_success) {
+		my $output = JSON::DWIW->from_json($response->decoded_content());
+		TRACE($response->decoded_content());
+
+		if(defined($output->{'status'})) {
+			if($output->{'status'} eq '200') {
+				# De-dupe nodes
+				my %seen;
+				@seen{@{$output->{'records'}}} = ();
+				my @unique = keys(%seen);
+				@NODES = @unique;
+
+				return;
+			}
+
+			WARN('list_nodes: ' . $output->{'status'} . ' - ' . $output->{'message'});
+		} else {
+			WARN('list_nodes: ' . $response->decoded_content());
+		}
+	} else {
+		ERROR('list_nodes: ' . $response->status_line());
+	}
+}
+
+sub child_finish {
+# Purpose: run when a child finishes to check exit status
+# and tally against $STOP_COUNT
+
+	my(undef, $exit, undef, undef, undef) = @_;
+
+	if(!defined($exit) || $exit eq 1) {
+		$STOP_CURRENT++;
+	}
+}
+
+##
+## Main
+##
+
+init();
+
+foreach my $node (@NODES) {
+	chomp($node);
+
+	$PM->start($node) and next;
+
+	if($STOP_CURRENT >= $STOP_COUNT) {
+		DEBUG("Skipping $node - hit error rate: $STOP_CURRENT of $STOP_COUNT");
+		$PM->finish(0);
+		next; # Need this incase $jobs == 0
+	}
+
+	DEBUG("Starting $node");
+
+	api('start_node.php', [
+		'job_id' => $JOB_ID,
+		'token' => $TOKEN,
+		'node' => $node
+	]);
+
+	my ($stdout, $stderr, $exit, $err) = do_ssh($node);
+
+	api('finish_node.php', [
+		'job_id' => $JOB_ID,
+		'token' => $TOKEN,
+		'node' => $node,
+		'stdout' => $stdout,
+		'stderr' => $stderr,
+		'exit_status' => $exit,
+		'error_message' => $err
+	]);
+
+	DEBUG("Finished $node");
+
+	if(defined($exit) && $exit eq 0) {
+		$PM->finish(0);
+	} else {
+		$PM->finish(1);
+	}
+}
+
+$PM->wait_all_children();
+api('finish_job.php', [
+	'job_id' => $JOB_ID,
+	'token' => $TOKEN
+]);
+
+exit(0);
+# End of Script
